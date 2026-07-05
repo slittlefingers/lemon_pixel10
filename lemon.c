@@ -218,8 +218,10 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             if (!arg[0] || (endp && *endp) || pid <= 0)
                 argp_error(state, "Invalid PID for --sgtable");
             opts->sgtable_pid = (pid_t)pid;
-            if (!opts->sgtable_min) opts->sgtable_min = 1ULL << 20;   /* 1 MiB */
-            if (!opts->sgtable_max) opts->sgtable_max = 64ULL << 20;  /* 64 MiB */
+            /* Report all buffers >= 64 KiB up to 2 GiB: the KV may be per-tensor (1/2 MiB dma-bufs)
+             * OR packed inside a large I/O arena (hundreds of MiB), so don't clip the upper end. */
+            if (!opts->sgtable_min) opts->sgtable_min = 64ULL << 10;    /* 64 KiB */
+            if (!opts->sgtable_max) opts->sgtable_max = 2048ULL << 20;  /* 2 GiB */
             break;
         }
 
