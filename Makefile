@@ -51,7 +51,7 @@ ifeq ($(STATIC), 1)
 endif
 
 # Files
-LOADER_SRCS := lemon.c mem.c dump.c disk.c net.c capabilities.c iomem.c socs/qcom.c socs/tensor.c
+LOADER_SRCS := lemon.c mem.c dump.c disk.c net.c capabilities.c iomem.c socs/qcom.c socs/tensor.c sgtable.c
 LOADER_BIN := lemon.$(MODE).$(ARCH)
 BPF_SRC := ebpf/mem.ebpf.c
 BPF_OBJ := ebpf/mem.ebpf.o

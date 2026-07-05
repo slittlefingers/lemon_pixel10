@@ -9,6 +9,7 @@
 
 #include <stdbool.h>
 #include <errno.h>
+#include <sys/types.h>   /* pid_t (for opts.sgtable_pid) */
 #include <sys/utsname.h>
 #include <sys/capability.h>
 #include <sys/queue.h>
@@ -150,6 +151,12 @@ struct options {
     };
 
     struct mem_range forced_range;  /* Address and size from -r/-v; only valid when force_dump_range. */
+
+    /* -S PID: instead of a memory dump, emit the pid's dma-buf sg_table page lists (see sgtable.c).
+     * sgtable_min/max bound which buffer sizes are reported (KV arenas). 0 pid = disabled. */
+    pid_t sgtable_pid;
+    unsigned long long sgtable_min;
+    unsigned long long sgtable_max;
 };
 
 /*

@@ -28,6 +28,7 @@ extern void cleanup_mem_ebpf(void);
 extern void range_list_free(struct ram_regions *list);
 extern int check_init_qualcomm(struct lemon_ctx *restrict ctx);
 extern int check_init_tensor(struct lemon_ctx *restrict ctx);
+extern int run_sgtable(struct lemon_ctx *restrict ctx, pid_t target);
 
 #define LEMON_VERSION  "lemon-" BRANCH "-" VERSION
 #define LEMON_DOC "LEMON - An eBPF Memory Dump Tool for x64 and ARM64 Linux and Android\nVersion " LEMON_VERSION
@@ -73,6 +74,7 @@ static const struct argp_option options[] = {
     {"dryrun",    'y', 0,               0, "Simulate a dump (not read the physical memory)", 3},
     {"huge",      'H', 0,               0, "Use huge pages (2MB) instead of 4KB", 3},
     {"qcom",      'q', 0,               0, "Force the use of Qualcomm quirks", 3},
+    {"sgtable",   'S', "PID",           0, "Emit the PID's dma-buf sg_table page lists (CSV, no dump)", 3},
     {"rphy",     'r', "ADDRESS:SIZE",  0, "Dump physical pages range", 3},
     {"rvirt",    'v', "ADDRESS:SIZE",  0, "Dump virtual pages range", 3},
     {"testrun",  't', 0,               0, "Force the use of BPF_PROG_TEST_RUN as eBPF trigger", 3},
@@ -210,12 +212,23 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             opts->force_dump_range = true;
             break;
 
+        case 'S': {
+            char *endp = NULL;
+            long pid = strtol(arg, &endp, 10);
+            if (!arg[0] || (endp && *endp) || pid <= 0)
+                argp_error(state, "Invalid PID for --sgtable");
+            opts->sgtable_pid = (pid_t)pid;
+            if (!opts->sgtable_min) opts->sgtable_min = 1ULL << 20;   /* 1 MiB */
+            if (!opts->sgtable_max) opts->sgtable_max = 64ULL << 20;  /* 64 MiB */
+            break;
+        }
+
         case ARGP_KEY_END:
             /* Port option is only valid in network dump mode */
             if(opts->dump_mode != MODE_NETWORK && opts->port != DEFAULT_PORT) argp_error(state, "-p can be used only in network dump mode");
 
-            /* Ensure at least one mode is specified */
-            if (opts->dump_mode == MODE_UNDEFINED) {
+            /* Ensure at least one mode is specified (sgtable mode needs no dump destination). */
+            if (opts->dump_mode == MODE_UNDEFINED && !opts->sgtable_pid) {
                 argp_error(state, "Either disk mode or network mode must be specified");
             }
 
@@ -574,6 +587,14 @@ int main(int argc, char **argv) {
 
     /* Disable kptr_restrict if needed */
     if((ret = toggle_kptr(&ctx))) goto cleanup;
+
+    /* -S PID: emit the process's dma-buf sg_table page lists (CSV) instead of a memory dump.
+     * Reuses the eBPF read primitive as a kernel-pointer deref oracle; no memory dump performed. */
+    if (ctx.opts.sgtable_pid) {
+        INFO("sgtable mode: walking dma-bufs for pid %d", ctx.opts.sgtable_pid);
+        ret = run_sgtable(&ctx, ctx.opts.sgtable_pid);
+        goto cleanup;
+    }
 
     /* Determine the memory dumpable regions */
     if((ret = init_translation(&ctx))) goto cleanup;
