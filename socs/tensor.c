@@ -7,6 +7,9 @@
 
 #include "../lemon.h"
 
+/* LEMON's kernel-memory read oracle (defined in mem.c); used to read kimage_voffset's value. */
+extern int read_kernel_memory(const uintptr_t addr, const size_t size, const unsigned char **restrict data);
+
 /*
  * tensor.c - Google Tensor (Pixel) support for LEMON.
  *
@@ -32,14 +35,22 @@
 #define TENSOR_MAX_CARVEOUTS 512
 
 /*
- * Safety margin applied on both sides of every carveout.
+ * Safety margins applied on both sides of a carveout to cover S2MPU spilling slightly past the
+ * device-tree boundary (or a CPU prefetch crossing into the carveout).
  *
- * The fatal read observed on Pixel 10 (Tensor G5) was the System-RAM page right before
- * tpu_fw@9fc00000, i.e. S2MPU protects slightly beyond the device-tree boundary (or a
- * prefetch spills in). 2 MB is a conservative cover for the S2MPU granularity.
- * TUNE THIS against the device via the bisection step in docs/test-runbook.md.
+ * We now use TWO margins instead of one blanket 2 MB:
+ *   - FW_MARGIN (firmware no-map carveouts): stay generous. Firmware carveouts have NO kernel data
+ *     adjacent, so a wide margin costs nothing and keeps us safe near the real S2MPU regions.
+ *   - RESV_MARGIN (/proc/iomem "reserved"): tiny. These reserved ranges sit next to live kernel
+ *     slab / kernel-image memory (init_task, swapper_pg_dir, sg_tables, dma_buf structs, name
+ *     strings). A 2 MB margin here was pure collateral — it pattern-filled readable metadata. A
+ *     small margin still covers prefetch/S2MPU-spill while returning that metadata to the dump.
+ * The kernel-image override in tensor_is_protected_page() additionally forces the kernel image to
+ * be read even if it lands inside a margin (the CPU executes from it, so it is never protected).
+ * TUNE via docs/test-runbook.md if a boundary page ever faults.
  */
-#define TENSOR_SAFETY_MARGIN 0x200000ULL   /* 2 MB */
+#define TENSOR_FW_MARGIN   0x200000ULL   /* 2 MB around firmware no-map carveouts */
+#define TENSOR_RESV_MARGIN 0x10000ULL    /* 64 KB around /proc/iomem reserved ranges */
 
 struct tensor_range {
     uint64_t start;    /* inclusive */
@@ -71,14 +82,14 @@ static bool node_has(const char *node_dir, const char *prop) {
 }
 
 /*
- * add_range() - record one [base, base+size) carveout, expanded by TENSOR_SAFETY_MARGIN.
+ * add_range() - record one [base, base+size) carveout, expanded by the caller's margin.
  * Stored inclusive [start, end]. Margin is clamped at 0 on the low side.
  */
-static void add_range(const struct lemon_ctx *restrict ctx, const char *name, uint64_t base, uint64_t size) {
+static void add_range(const struct lemon_ctx *restrict ctx, const char *name, uint64_t base, uint64_t size, uint64_t margin) {
     if (size == 0 || g_nranges >= TENSOR_MAX_CARVEOUTS) return;
 
-    uint64_t lo = (base > TENSOR_SAFETY_MARGIN) ? base - TENSOR_SAFETY_MARGIN : 0;
-    uint64_t hi = base + size - 1 + TENSOR_SAFETY_MARGIN;
+    uint64_t lo = (base > margin) ? base - margin : 0;
+    uint64_t hi = base + size - 1 + margin;
 
     g_ranges[g_nranges].start = lo;
     g_ranges[g_nranges].end   = hi;
@@ -115,7 +126,7 @@ static void parse_node_reg(const struct lemon_ctx *restrict ctx, const char *nod
         return;
     }
     for (size_t off = 0; off + 16 <= n; off += 16)
-        add_range(ctx, name, be64(buf + off), be64(buf + off + 8));
+        add_range(ctx, name, be64(buf + off), be64(buf + off + 8), TENSOR_FW_MARGIN);
 }
 
 /*
@@ -142,7 +153,7 @@ static void add_iomem_reserved(const struct lemon_ctx *restrict ctx) {
         if (sscanf(line, "%llx-%llx : %n", &s, &e, &pos) < 2 || pos == 0)
             continue;
         if (strcasestr(line + pos, "reserved")) {
-            add_range(ctx, "iomem-reserved", s, e - s + 1);
+            add_range(ctx, "iomem-reserved", s, e - s + 1, TENSOR_RESV_MARGIN);
             added++;
         }
     }
@@ -206,8 +217,8 @@ int check_init_tensor(struct lemon_ctx *restrict ctx) {
     /* Second source: reserved ranges nested inside System RAM (not in the device tree). */
     add_iomem_reserved(ctx);
 
-    INFO("tensor: %d no-map carveouts + iomem reserved -> %d avoid-ranges (margin 0x%llx)",
-         n_nomap, g_nranges, (unsigned long long)TENSOR_SAFETY_MARGIN);
+    INFO("tensor: %d no-map carveouts + iomem reserved -> %d avoid-ranges (fw-margin 0x%llx, resv-margin 0x%llx, kimage forced-read)",
+         n_nomap, g_nranges, (unsigned long long)TENSOR_FW_MARGIN, (unsigned long long)TENSOR_RESV_MARGIN);
 
     if (g_nranges == 0)
         WARN("tensor: no carveout ranges parsed; dump may hit S2MPU and reboot");
@@ -222,7 +233,44 @@ int check_init_tensor(struct lemon_ctx *restrict ctx) {
  * Mirrors qualcomm_is_secure_page(): dump.c calls this and pattern-fills instead of
  * reading when it returns true, keeping the LiME physical layout intact.
  */
+/*
+ * Kernel-image physical window [g_kimage_lo, g_kimage_hi). The kernel executes from its own image,
+ * so those pages can NEVER be S2MPU-protected -> always safe to read, even when they fall inside an
+ * avoid-range or its margin. This is what recovers init_task, swapper_pg_dir and the kernel .data
+ * that the old blanket 2 MB margin pattern-filled. _text_PA = _text - kimage_voffset.
+ */
+static uint64_t g_kimage_lo = 0, g_kimage_hi = 0;
+static int g_kimage_ready = 0;
+
+static void tensor_init_kimage(void) {
+    g_kimage_ready = 1;   /* try once; on failure the override is simply inactive */
+    uintptr_t text = 0, end = 0, vo_addr = 0;
+    unsigned long addr;
+    char line[512], name[128];
+    FILE *fp = fopen("/proc/kallsyms", "r");
+    if (!fp) return;
+    while (fgets(line, sizeof(line), fp)) {
+        if (sscanf(line, "%lx %*c %127s", &addr, name) != 2) continue;
+        if      (!strcmp(name, "_text"))          text = (uintptr_t)addr;
+        else if (!strcmp(name, "_end"))           end = (uintptr_t)addr;
+        else if (!strcmp(name, "kimage_voffset")) vo_addr = (uintptr_t)addr;
+    }
+    fclose(fp);
+    if (!text || !end || !vo_addr || end <= text) return;
+    const unsigned char *d = NULL;
+    if (read_kernel_memory(vo_addr, 8, &d) < 0 || !d) return;
+    uint64_t voff = *(const uint64_t *)d;
+    g_kimage_lo = (uint64_t)text - voff;
+    g_kimage_hi = (uint64_t)end  - voff;
+    INFO("tensor: kernel-image PA [0x%llx, 0x%llx) forced readable (never S2MPU-protected)",
+         (unsigned long long)g_kimage_lo, (unsigned long long)g_kimage_hi);
+}
+
 bool tensor_is_protected_page(uintptr_t page_start) {
+    if (!g_kimage_ready) tensor_init_kimage();
+    /* kimage override: kernel image is CPU-executed, never S2MPU-protected -> always read it. */
+    if (g_kimage_lo && (uint64_t)page_start >= g_kimage_lo && (uint64_t)page_start < g_kimage_hi)
+        return false;
     for (int i = 0; i < g_nranges; i++)
         if ((uint64_t)page_start >= g_ranges[i].start &&
             (uint64_t)page_start <= g_ranges[i].end)
