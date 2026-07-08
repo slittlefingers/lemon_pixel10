@@ -102,6 +102,80 @@ static void add_range(const struct lemon_ctx *restrict ctx, const char *name, ui
 }
 
 /*
+ * CMA whitelist - the fix for "reserved but actually readable" over-avoidance.
+ *
+ * CMA areas (Contiguous Memory Allocator: video vframe/vstream pools, dma pools, pkvm_iommu_cma) are
+ * DYNAMICALLY-placed movable RAM. They appear as "reserved" in /proc/iomem, so add_iomem_reserved()
+ * used to pattern-fill them - but they are ordinary CPU-readable RAM that the page allocator hands to
+ * movable/zsmalloc allocations (swap compression). Filling them destroyed readable kernel/user data
+ * (e.g. the swapped scudo heap that holds the runtime name->buffer map). We read the kernel's
+ * cma_areas[] at init and whitelist their runtime ranges. CMA placement is per-boot dynamic, so we
+ * MUST read it live each capture - never hardcode.
+ *
+ * struct cma: base_pfn@0, count@8 are the stable first two fields (units: pages). The array stride =
+ * sizeof(struct cma) is config-dependent (spinlock_t grows under lockdep). Verify for your kernel:
+ *     pahole -C cma vmlinux        (or from the vmlinux BTF)
+ * A wrong stride is caught by the per-entry sanity check below - bad entries are skipped, so at worst
+ * we fall back to the old conservative behaviour (never a fatal read).
+ */
+#ifndef TENSOR_CMA_STRIDE
+#define TENSOR_CMA_STRIDE 136   /* sizeof(struct cma) on 6.6 android15-4k; set from BTF/pahole per build */
+#endif
+#define TENSOR_MAX_CMA 32
+
+struct tensor_cma { uint64_t start; uint64_t end; };   /* inclusive phys range, CPU-readable */
+static struct tensor_cma g_cma[TENSOR_MAX_CMA];
+static int g_ncma = 0;
+
+/* True if a physical address lies in a whitelisted CMA (readable) region. */
+static bool in_cma(uint64_t pa) {
+    for (int i = 0; i < g_ncma; i++)
+        if (pa >= g_cma[i].start && pa <= g_cma[i].end) return true;
+    return false;
+}
+
+/*
+ * tensor_init_cma() - read the kernel's cma_areas[] and record each CMA region as readable.
+ * Uses the same /proc/kallsyms + read_kernel_memory oracle as tensor_init_kimage(). Dynamic per boot.
+ */
+static void tensor_init_cma(void) {
+    uintptr_t areas = 0, count_addr = 0;
+    unsigned long addr;
+    char line[512], sym[128];
+    FILE *fp = fopen("/proc/kallsyms", "r");
+    if (!fp) return;
+    while (fgets(line, sizeof(line), fp)) {
+        if (sscanf(line, "%lx %*c %127s", &addr, sym) != 2) continue;
+        if      (!strcmp(sym, "cma_areas"))      areas = (uintptr_t)addr;
+        else if (!strcmp(sym, "cma_area_count")) count_addr = (uintptr_t)addr;
+    }
+    fclose(fp);
+    if (!areas || !count_addr) { DBG("tensor: cma_areas/cma_area_count not in kallsyms; CMA not whitelisted"); return; }
+
+    const unsigned char *d = NULL;
+    if (read_kernel_memory(count_addr, 4, &d) < 0 || !d) return;
+    unsigned int n = *(const unsigned int *)d;
+    if (n > TENSOR_MAX_CMA) n = TENSOR_MAX_CMA;
+
+    for (unsigned int i = 0; i < n; i++) {
+        const unsigned char *e = NULL;
+        if (read_kernel_memory(areas + (uintptr_t)i * TENSOR_CMA_STRIDE, 16, &e) < 0 || !e) continue;
+        uint64_t base_pfn = *(const uint64_t *)e;
+        uint64_t cnt      = *(const uint64_t *)(e + 8);
+        /* Sanity-guard a wrong stride / empty slot: plausible pfn and page count only. */
+        if (base_pfn == 0 || cnt == 0 || base_pfn > 0x2000000ULL || cnt > 0x1000000ULL) continue;
+        if (g_ncma >= TENSOR_MAX_CMA) break;
+        g_cma[g_ncma].start = base_pfn << 12;
+        g_cma[g_ncma].end   = ((base_pfn + cnt) << 12) - 1;
+        INFO("tensor: CMA readable phys 0x%llx-0x%llx (%llu MB) whitelisted",
+             (unsigned long long)g_cma[g_ncma].start, (unsigned long long)g_cma[g_ncma].end,
+             (unsigned long long)(cnt >> 8));
+        g_ncma++;
+    }
+    INFO("tensor: %d CMA region(s) whitelisted from kernel cma_areas[] (dynamic, read per capture)", g_ncma);
+}
+
+/*
  * parse_node_reg() - read a carveout node's "reg" and add its ranges.
  * @node_dir: absolute path to the reserved-memory child directory.
  *
@@ -134,18 +208,21 @@ static void parse_node_reg(const struct lemon_ctx *restrict ctx, const char *nod
  *
  * Second danger source (see recon-findings.md section 10): LEMON dumps "System RAM"
  * ranges but does NOT subtract the reserved children nested within them (iomem.c
- * range_subtract() is unused). On Tensor those nested reserved regions - e.g.
- * 0xacc000000-0xaf83fffff inside the 0x880000000-0xaffffffff bank - are S2MPU-protected
- * and fatal to read, yet they are absent from the device-tree reserved-memory node.
- * Add every /proc/iomem "reserved" range to the avoid-list. Conservative: a few reserved
- * ranges read fine, but skipping them only costs a small margin.
+ * range_subtract() is unused). Some nested reserved regions really are S2MPU-fatal, so we
+ * add every /proc/iomem "reserved" range to the avoid-list.
+ *
+ * EXCEPTION - CMA: large "reserved" children like 0xacc000000-0xaf83fffff (the vframe/vstream
+ * video CMA pools) are NOT firmware - they are CPU-readable movable RAM the allocator uses for
+ * movable/zsmalloc pages. Blanket-filling them destroyed readable data (the swapped scudo heap
+ * with the runtime name->buffer map). We therefore whitelist CMA (tensor_init_cma, from the kernel's
+ * cma_areas[]) and skip any reserved range that falls inside it. Must run tensor_init_cma() first.
  */
 static void add_iomem_reserved(const struct lemon_ctx *restrict ctx) {
     FILE *fp = fopen("/proc/iomem", "r");
     if (!fp) { DBG("tensor: cannot open /proc/iomem for reserved scan"); return; }
 
     char line[512];
-    int added = 0;
+    int added = 0, skipped_cma = 0;
     while (fgets(line, sizeof(line), fp)) {
         unsigned long long s, e;
         int pos = 0;
@@ -153,12 +230,15 @@ static void add_iomem_reserved(const struct lemon_ctx *restrict ctx) {
         if (sscanf(line, "%llx-%llx : %n", &s, &e, &pos) < 2 || pos == 0)
             continue;
         if (strcasestr(line + pos, "reserved")) {
+            /* CMA pools show as "reserved" but are readable movable RAM -> do not avoid them. */
+            if (in_cma(s) && in_cma(e)) { skipped_cma++; continue; }
             add_range(ctx, "iomem-reserved", s, e - s + 1, TENSOR_RESV_MARGIN);
             added++;
         }
     }
     fclose(fp);
-    INFO("tensor: +%d /proc/iomem reserved ranges added to avoid-list", added);
+    INFO("tensor: +%d /proc/iomem reserved ranges added to avoid-list (%d CMA ranges skipped as readable)",
+         added, skipped_cma);
 }
 
 /*
@@ -213,6 +293,10 @@ int check_init_tensor(struct lemon_ctx *restrict ctx) {
         parse_node_reg(ctx, node_dir, de->d_name);
     }
     closedir(d);
+
+    /* Whitelist CMA (readable movable RAM that /proc/iomem labels "reserved") BEFORE the iomem scan,
+     * so add_iomem_reserved() can skip it. CMA placement is dynamic - read live from the kernel. */
+    tensor_init_cma();
 
     /* Second source: reserved ranges nested inside System RAM (not in the device tree). */
     add_iomem_reserved(ctx);
@@ -270,6 +354,10 @@ bool tensor_is_protected_page(uintptr_t page_start) {
     if (!g_kimage_ready) tensor_init_kimage();
     /* kimage override: kernel image is CPU-executed, never S2MPU-protected -> always read it. */
     if (g_kimage_lo && (uint64_t)page_start >= g_kimage_lo && (uint64_t)page_start < g_kimage_hi)
+        return false;
+    /* CMA override: movable RAM (video/dma pools) the allocator uses is CPU-readable -> never fill it,
+     * even if a firmware carveout's margin spilled onto it. (g_ncma from tensor_init_cma().) */
+    if (in_cma((uint64_t)page_start))
         return false;
     for (int i = 0; i < g_nranges; i++)
         if ((uint64_t)page_start >= g_ranges[i].start &&
