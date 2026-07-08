@@ -102,40 +102,83 @@ static void add_range(const struct lemon_ctx *restrict ctx, const char *name, ui
 }
 
 /*
- * CMA whitelist - the fix for "reserved but actually readable" over-avoidance.
+ * CMA handling - bitmap-aware. A CMA area (video vframe/vstream, dma pools, pkvm_iommu_cma) is a MIX:
+ *   - pages cma_alloc'd to a device (video codec, pKVM IOMMU) are S2MPU-protected. A CPU read raises
+ *     a FATAL async SError -> reboot.
+ *   - pages the buddy allocator lends to MOVABLE allocations (anon, zsmalloc swap) are ordinary
+ *     readable RAM. The runtime name->buffer map's swapped pages land here.
+ * A whole-region whitelist is UNSAFE (it reads the device pages and reboots). Instead we read each
+ * region's struct cma.bitmap and decide PER PAGE: bit SET = cma_alloc'd (device, protected -> fill),
+ * bit CLEAR = free/movable (readable -> read). CMA placement + bitmap are dynamic per boot, so we
+ * read them live each capture from the kernel's cma_areas[] (never hardcode).
  *
- * CMA areas (Contiguous Memory Allocator: video vframe/vstream pools, dma pools, pkvm_iommu_cma) are
- * DYNAMICALLY-placed movable RAM. They appear as "reserved" in /proc/iomem, so add_iomem_reserved()
- * used to pattern-fill them - but they are ordinary CPU-readable RAM that the page allocator hands to
- * movable/zsmalloc allocations (swap compression). Filling them destroyed readable kernel/user data
- * (e.g. the swapped scudo heap that holds the runtime name->buffer map). We read the kernel's
- * cma_areas[] at init and whitelist their runtime ranges. CMA placement is per-boot dynamic, so we
- * MUST read it live each capture - never hardcode.
- *
- * struct cma: base_pfn@0, count@8 are the stable first two fields (units: pages). The array stride =
- * sizeof(struct cma) is config-dependent (spinlock_t grows under lockdep). Verify for your kernel:
+ * struct cma (units: pages): base_pfn@0, count@8, bitmap@16 (ulong*), order_per_bit@24. The array
+ * stride = sizeof(struct cma) is config-dependent (spinlock_t grows under lockdep). Verify with:
  *     pahole -C cma vmlinux        (or from the vmlinux BTF)
- * A wrong stride is caught by the per-entry sanity check below - bad entries are skipped, so at worst
- * we fall back to the old conservative behaviour (never a fatal read).
+ * A wrong stride / bad entry is dropped by the sanity check, falling back to conservative avoidance.
+ *
+ * WARNING: async SError is unforgiving - one protected page read = reboot. This relies on
+ * "S2MPU-protected set == cma-bitmap SET set" (validated offline on this SoC: map pages all CLEAR,
+ * pkvm_iommu_cma all SET). A snapshot race (a device allocating between init and the page read) is
+ * inherent - dump with the target app frozen and the system as quiescent as possible.
  */
 #ifndef TENSOR_CMA_STRIDE
 #define TENSOR_CMA_STRIDE 136   /* sizeof(struct cma) on 6.6 android15-4k; set from BTF/pahole per build */
 #endif
 #define TENSOR_MAX_CMA 32
+enum { CMA_NOT = 0, CMA_READABLE = 1, CMA_DEVICE = 2 };
 
-struct tensor_cma { uint64_t start; uint64_t end; };   /* inclusive phys range, CPU-readable */
+struct tensor_cma {
+    uint64_t base_pfn;
+    uint64_t npages;         /* struct cma.count */
+    uint32_t order_per_bit;
+    uint64_t nbits;          /* npages >> order_per_bit */
+    uint8_t *bitmap;         /* malloc'd snapshot; bit SET = device (protected), CLEAR = readable */
+};
 static struct tensor_cma g_cma[TENSOR_MAX_CMA];
 static int g_ncma = 0;
 
-/* True if a physical address lies in a whitelisted CMA (readable) region. */
-static bool in_cma(uint64_t pa) {
+/* True if pfn's bit is set (device-allocated -> protected). Unknown -> treat as protected (safe). */
+static bool cma_bit_set(const struct tensor_cma *c, uint64_t pfn) {
+    uint64_t idx = (pfn - c->base_pfn) >> c->order_per_bit;
+    if (idx >= c->nbits || !c->bitmap) return true;
+    return (c->bitmap[idx >> 3] >> (idx & 7)) & 1;
+}
+
+/* Classify a physical address against the CMA bitmaps. */
+static int cma_status(uint64_t pa) {
+    uint64_t pfn = pa >> 12;
     for (int i = 0; i < g_ncma; i++)
-        if (pa >= g_cma[i].start && pa <= g_cma[i].end) return true;
+        if (pfn >= g_cma[i].base_pfn && pfn < g_cma[i].base_pfn + g_cma[i].npages)
+            return cma_bit_set(&g_cma[i], pfn) ? CMA_DEVICE : CMA_READABLE;
+    return CMA_NOT;
+}
+
+/* True if a physical address lies in any CMA region (regardless of bitmap). */
+static bool cma_contains(uint64_t pa) {
+    uint64_t pfn = pa >> 12;
+    for (int i = 0; i < g_ncma; i++)
+        if (pfn >= g_cma[i].base_pfn && pfn < g_cma[i].base_pfn + g_cma[i].npages) return true;
+    return false;
+}
+
+/* True if inclusive [start,end] touches a CMA region containing at least one device (protected)
+ * page - such a huge chunk MUST be reprocessed at PAGE_SIZE so the per-page bitmap applies. */
+static bool cma_range_has_device(uint64_t start, uint64_t end) {
+    for (int i = 0; i < g_ncma; i++) {
+        uint64_t rs = g_cma[i].base_pfn << 12;
+        uint64_t re = ((g_cma[i].base_pfn + g_cma[i].npages) << 12) - 1;
+        if (start > re || end < rs) continue;
+        uint64_t p0 = (start > rs ? start : rs) >> 12;
+        uint64_t p1 = (end   < re ? end   : re) >> 12;
+        for (uint64_t pfn = p0; pfn <= p1; pfn++)
+            if (cma_bit_set(&g_cma[i], pfn)) return true;
+    }
     return false;
 }
 
 /*
- * tensor_init_cma() - read the kernel's cma_areas[] and record each CMA region as readable.
+ * tensor_init_cma() - read cma_areas[] AND each region's allocation bitmap from the kernel.
  * Uses the same /proc/kallsyms + read_kernel_memory oracle as tensor_init_kimage(). Dynamic per boot.
  */
 static void tensor_init_cma(const struct lemon_ctx *restrict ctx) {
@@ -150,7 +193,7 @@ static void tensor_init_cma(const struct lemon_ctx *restrict ctx) {
         else if (!strcmp(sym, "cma_area_count")) count_addr = (uintptr_t)addr;
     }
     fclose(fp);
-    if (!areas || !count_addr) { DBG("tensor: cma_areas/cma_area_count not in kallsyms; CMA not whitelisted"); return; }
+    if (!areas || !count_addr) { DBG("tensor: cma_areas/cma_area_count not in kallsyms; CMA not handled"); return; }
 
     const unsigned char *d = NULL;
     if (read_kernel_memory(count_addr, 4, &d) < 0 || !d) return;
@@ -159,20 +202,39 @@ static void tensor_init_cma(const struct lemon_ctx *restrict ctx) {
 
     for (unsigned int i = 0; i < n; i++) {
         const unsigned char *e = NULL;
-        if (read_kernel_memory(areas + (uintptr_t)i * TENSOR_CMA_STRIDE, 16, &e) < 0 || !e) continue;
+        if (read_kernel_memory(areas + (uintptr_t)i * TENSOR_CMA_STRIDE, 32, &e) < 0 || !e) continue;
         uint64_t base_pfn = *(const uint64_t *)e;
         uint64_t cnt      = *(const uint64_t *)(e + 8);
-        /* Sanity-guard a wrong stride / empty slot: plausible pfn and page count only. */
-        if (base_pfn == 0 || cnt == 0 || base_pfn > 0x2000000ULL || cnt > 0x1000000ULL) continue;
+        uint64_t bmp_ptr  = *(const uint64_t *)(e + 16);
+        uint32_t opb      = *(const uint32_t *)(e + 24);
+        /* Sanity-guard a wrong stride / empty slot: plausible pfn, page count and bitmap pointer. */
+        if (base_pfn == 0 || cnt == 0 || base_pfn > 0x2000000ULL || cnt > 0x1000000ULL || !bmp_ptr) continue;
         if (g_ncma >= TENSOR_MAX_CMA) break;
-        g_cma[g_ncma].start = base_pfn << 12;
-        g_cma[g_ncma].end   = ((base_pfn + cnt) << 12) - 1;
-        INFO("tensor: CMA readable phys 0x%llx-0x%llx (%llu MB) whitelisted",
-             (unsigned long long)g_cma[g_ncma].start, (unsigned long long)g_cma[g_ncma].end,
-             (unsigned long long)(cnt >> 8));
-        g_ncma++;
+
+        uint64_t nbits  = cnt >> opb;
+        size_t   nbytes = (size_t)((nbits + 7) / 8);
+        uint8_t *bm = calloc(1, nbytes + 8);
+        if (!bm) continue;
+        /* Read the bitmap 8 bytes at a time (the proven read_kernel_memory granule). */
+        int ok = 1;
+        for (size_t off = 0; off < nbytes; off += 8) {
+            const unsigned char *w = NULL;
+            if (read_kernel_memory((uintptr_t)bmp_ptr + off, 8, &w) < 0 || !w) { ok = 0; break; }
+            size_t chunk = (nbytes - off < 8) ? (nbytes - off) : 8;
+            memcpy(bm + off, w, chunk);
+        }
+        if (!ok) { free(bm); continue; }
+
+        struct tensor_cma *c = &g_cma[g_ncma++];
+        c->base_pfn = base_pfn; c->npages = cnt; c->order_per_bit = opb;
+        c->nbits = nbits; c->bitmap = bm;
+        uint64_t setc = 0;
+        for (uint64_t b = 0; b < nbits; b++) if ((bm[b >> 3] >> (b & 7)) & 1) setc++;
+        INFO("tensor: CMA phys 0x%llx-0x%llx (%llu MB): %llu device page(s) protected, rest readable",
+             (unsigned long long)(base_pfn << 12), (unsigned long long)(((base_pfn + cnt) << 12) - 1),
+             (unsigned long long)(cnt >> 8), (unsigned long long)setc);
     }
-    INFO("tensor: %d CMA region(s) whitelisted from kernel cma_areas[] (dynamic, read per capture)", g_ncma);
+    INFO("tensor: %d CMA region(s) parsed from kernel cma_areas[] with per-page bitmap (dynamic per boot)", g_ncma);
 }
 
 /*
@@ -230,8 +292,9 @@ static void add_iomem_reserved(const struct lemon_ctx *restrict ctx) {
         if (sscanf(line, "%llx-%llx : %n", &s, &e, &pos) < 2 || pos == 0)
             continue;
         if (strcasestr(line + pos, "reserved")) {
-            /* CMA pools show as "reserved" but are readable movable RAM -> do not avoid them. */
-            if (in_cma(s) && in_cma(e)) { skipped_cma++; continue; }
+            /* CMA pools show as "reserved"; skip them here - decided per-page by the CMA bitmap
+             * (device pages filled, movable/free pages read) in tensor_is_protected_page(). */
+            if (cma_contains(s) && cma_contains(e)) { skipped_cma++; continue; }
             add_range(ctx, "iomem-reserved", s, e - s + 1, TENSOR_RESV_MARGIN);
             added++;
         }
@@ -355,10 +418,11 @@ bool tensor_is_protected_page(uintptr_t page_start) {
     /* kimage override: kernel image is CPU-executed, never S2MPU-protected -> always read it. */
     if (g_kimage_lo && (uint64_t)page_start >= g_kimage_lo && (uint64_t)page_start < g_kimage_hi)
         return false;
-    /* CMA override: movable RAM (video/dma pools) the allocator uses is CPU-readable -> never fill it,
-     * even if a firmware carveout's margin spilled onto it. (g_ncma from tensor_init_cma().) */
-    if (in_cma((uint64_t)page_start))
-        return false;
+    /* Per-page CMA decision via the allocation bitmap: a cma_alloc'd (device) page is S2MPU-protected
+     * -> fill; a free/movable page (where swapped anon/zsmalloc data lives) is CPU-readable -> read. */
+    int cs = cma_status((uint64_t)page_start);
+    if (cs == CMA_DEVICE)   return true;
+    if (cs == CMA_READABLE) return false;
     for (int i = 0; i < g_nranges; i++)
         if ((uint64_t)page_start >= g_ranges[i].start &&
             (uint64_t)page_start <= g_ranges[i].end)
@@ -374,6 +438,10 @@ bool tensor_is_protected_page(uintptr_t page_start) {
  * Note start<=end always holds (dump.c clamps chunk_end >= chunk_start).
  */
 bool tensor_range_overlaps(uintptr_t start, uintptr_t end) {
+    /* A huge (2 MB) chunk that spans a CMA device (protected) page must be reprocessed at PAGE_SIZE,
+     * so the per-page bitmap in tensor_is_protected_page() fills only the protected pages and reads
+     * the movable/free ones. All-readable CMA chunks fall through and can be read wholesale. */
+    if (cma_range_has_device((uint64_t)start, (uint64_t)end)) return true;
     for (int i = 0; i < g_nranges; i++)
         if ((uint64_t)start <= g_ranges[i].end &&
             (uint64_t)end   >= g_ranges[i].start)
