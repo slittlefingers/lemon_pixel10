@@ -138,7 +138,7 @@ static bool in_cma(uint64_t pa) {
  * tensor_init_cma() - read the kernel's cma_areas[] and record each CMA region as readable.
  * Uses the same /proc/kallsyms + read_kernel_memory oracle as tensor_init_kimage(). Dynamic per boot.
  */
-static void tensor_init_cma(void) {
+static void tensor_init_cma(const struct lemon_ctx *restrict ctx) {
     uintptr_t areas = 0, count_addr = 0;
     unsigned long addr;
     char line[512], sym[128];
@@ -296,7 +296,7 @@ int check_init_tensor(struct lemon_ctx *restrict ctx) {
 
     /* Whitelist CMA (readable movable RAM that /proc/iomem labels "reserved") BEFORE the iomem scan,
      * so add_iomem_reserved() can skip it. CMA placement is dynamic - read live from the kernel. */
-    tensor_init_cma();
+    tensor_init_cma(ctx);
 
     /* Second source: reserved ranges nested inside System RAM (not in the device tree). */
     add_iomem_reserved(ctx);
