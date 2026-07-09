@@ -285,9 +285,68 @@ static uint64_t g_pt_pages[TENSOR_MAX_PT_PAGES];    /* page-aligned PAs of kerne
 static int g_npt = 0;
 static int g_pt_ready = 0;
 
+/*
+ * vmemmap backing allow-set. The struct-page array (mem_map) is the physical memory that the vmemmap
+ * VA region maps to; the kernel dereferences struct pages on every page operation, so it is ALWAYS
+ * CPU-readable and never S2MPU-protected - the same provably-safe class as page tables. iomem labels
+ * its memblock reservation "reserved", which add_iomem_reserved() then over-fills (the 287 MB block
+ * that blocks offline struct-page walks). We collect its actual physical backing LIVE, by reading the
+ * (now force-read) kernel page tables for the vmemmap VA range and recording the leaf output ranges of
+ * only the PRESENT mappings - never a hardcoded span. This precisely force-reads the struct-page array
+ * while leaving every other unknown iomem-reserved range's behaviour unchanged.
+ */
+#define TENSOR_KVA_BASE      0xFFFFFF8000000000ULL   /* TTBR1 (kernel) VA base for the PGD walk (VA_BITS=39) */
+#define TENSOR_VMEMMAP_LO    0xFFFFFFFE00000000ULL   /* VMEMMAP_START */
+#define TENSOR_VMEMMAP_HI    0xFFFFFFFFC0000000ULL   /* below the top fixmap/PCI-IO window (their leaves are MMIO, not RAM) */
+#define TENSOR_PMD_BLK_MASK  0x0000FFFFFFE00000ULL   /* 2MB block-descriptor output address bits [47:21] */
+#define TENSOR_IS_VMEMMAP(va) ((va) >= TENSOR_VMEMMAP_LO && (va) < TENSOR_VMEMMAP_HI)
+#define TENSOR_MAX_VMBK 8192
+struct tensor_range2 { uint64_t base, end; };       /* inclusive */
+static struct tensor_range2 g_vmbk[TENSOR_MAX_VMBK];
+static int g_nvmbk = 0;
+
 static int tensor_pt_cmp(const void *a, const void *b) {
     uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
     return (x > y) - (x < y);
+}
+
+static void tensor_add_backing(uint64_t base, uint64_t size) {
+    if (g_nvmbk >= TENSOR_MAX_VMBK || !size) return;
+    g_vmbk[g_nvmbk].base = base;
+    g_vmbk[g_nvmbk].end  = base + size - 1;
+    g_nvmbk++;
+}
+
+static int tensor_vmbk_cmp(const void *a, const void *b) {
+    uint64_t x = ((const struct tensor_range2 *)a)->base, y = ((const struct tensor_range2 *)b)->base;
+    return (x > y) - (x < y);
+}
+
+/* Sort + merge the collected 2MB-block backing ranges into a few large contiguous ranges. */
+static void tensor_merge_backing(void) {
+    if (g_nvmbk < 2) return;
+    qsort(g_vmbk, g_nvmbk, sizeof(g_vmbk[0]), tensor_vmbk_cmp);
+    int w = 0;
+    for (int r = 1; r < g_nvmbk; r++) {
+        if (g_vmbk[r].base <= g_vmbk[w].end + 1) {          /* overlap or adjacent -> merge */
+            if (g_vmbk[r].end > g_vmbk[w].end) g_vmbk[w].end = g_vmbk[r].end;
+        } else {
+            g_vmbk[++w] = g_vmbk[r];
+        }
+    }
+    g_nvmbk = w + 1;
+}
+
+/* Binary search over the merged backing ranges - called per dumped page, must be fast. */
+static bool tensor_is_backing(uint64_t pa) {
+    int lo = 0, hi = g_nvmbk - 1;
+    while (lo <= hi) {
+        int m = (lo + hi) / 2;
+        if      (pa < g_vmbk[m].base) hi = m - 1;
+        else if (pa > g_vmbk[m].end)  lo = m + 1;
+        else return true;
+    }
+    return false;
 }
 
 /* Linear scan over the (unsorted, growing) set - dedup / cycle guard DURING the walk. n is small. */
@@ -311,11 +370,12 @@ static bool tensor_pt_is_pagetable(uint64_t pa) {
 }
 
 /*
- * tensor_pt_walk() - recurse one page-table level, recording each table page.
- * @pa: physical address of this table page. @level: 0=PGD,1=PMD,2=PTE (VA_BITS=39, 3 levels).
+ * tensor_pt_walk() - recurse one page-table level, recording each table page (PT allow-set) and, for
+ * leaf mappings in the vmemmap VA window, their output ranges (struct-page backing allow-set).
+ * @pa: physical address of this table page. @level: 0=PGD,1=PMD,2=PTE. @va_base: VA this table covers.
  * The read oracle returns a shared buffer, so copy the page out before recursing (child reads clobber it).
  */
-static void tensor_pt_walk(const struct lemon_ctx *restrict ctx, uint64_t pa, int level) {
+static void tensor_pt_walk(const struct lemon_ctx *restrict ctx, uint64_t pa, int level, uint64_t va_base) {
     if (level > 2 || g_npt >= TENSOR_MAX_PT_PAGES) return;
     pa &= ~(uint64_t)(PAGE_SIZE - 1);
     if (tensor_pt_seen(pa)) return;
@@ -324,12 +384,18 @@ static void tensor_pt_walk(const struct lemon_ctx *restrict ctx, uint64_t pa, in
     unsigned char page[PAGE_SIZE];
     memcpy(page, d, PAGE_SIZE);
     g_pt_pages[g_npt++] = pa;
-    if (level >= 2) return;                    /* PTE table: entries map data pages, not child tables */
+    const int sh = (level == 0) ? 30 : (level == 1) ? 21 : 12;
     for (int i = 0; i < (int)(PAGE_SIZE / 8); i++) {
         uint64_t e;
         memcpy(&e, page + i * 8, 8);
-        if ((e & 3) == 3)                      /* table descriptor -> next-level table */
-            tensor_pt_walk(ctx, e & TENSOR_PT_OA_MASK, level + 1);
+        int t = e & 3;
+        uint64_t va = va_base | ((uint64_t)i << sh);
+        if (level < 2 && t == 3)                              /* table descriptor -> next-level table */
+            tensor_pt_walk(ctx, e & TENSOR_PT_OA_MASK, level + 1, va);
+        else if (level == 1 && t == 1 && TENSOR_IS_VMEMMAP(va))  /* 2MB block: struct-page backing */
+            tensor_add_backing(e & TENSOR_PMD_BLK_MASK, 0x200000ULL);
+        else if (level == 2 && t == 3 && TENSOR_IS_VMEMMAP(va))  /* 4KB page: struct-page backing */
+            tensor_add_backing(e & TENSOR_PT_OA_MASK, PAGE_SIZE);
     }
 }
 
@@ -359,10 +425,14 @@ static void tensor_init_pt_allowset(const struct lemon_ctx *restrict ctx) {
         uint64_t e;
         memcpy(&e, root + i * 8, 8);
         if ((e & 3) == 3)                      /* PGD table descriptor -> PMD table */
-            tensor_pt_walk(ctx, e & TENSOR_PT_OA_MASK, 1);
+            tensor_pt_walk(ctx, e & TENSOR_PT_OA_MASK, 1, TENSOR_KVA_BASE | ((uint64_t)i << 30));
     }
     qsort(g_pt_pages, g_npt, sizeof(uint64_t), tensor_pt_cmp);
-    INFO("tensor: kernel page-table allow-set = %d PT pages force-read (unfilled even inside carveouts)", g_npt);
+    tensor_merge_backing();
+    uint64_t bk_mb = 0;
+    for (int i = 0; i < g_nvmbk; i++) bk_mb += (g_vmbk[i].end - g_vmbk[i].base + 1);
+    INFO("tensor: kernel page-table allow-set = %d PT pages; vmemmap struct-page backing = %d range(s), %llu MB (both force-read)",
+         g_npt, g_nvmbk, (unsigned long long)(bk_mb >> 20));
 }
 
 /*
@@ -562,6 +632,11 @@ bool tensor_is_protected_page(uintptr_t page_start) {
      * they fall inside a carveout margin (fixes vmemmap/swapper over-fill; keeps address translation
      * intact in the dump). Built in check_init_tensor from swapper_pg_dir. */
     if (g_pt_ready && tensor_pt_is_pagetable((uint64_t)page_start))
+        return false;
+    /* struct-page backing override: the mem_map array (physical backing of the vmemmap VA region) is
+     * dereferenced by the kernel on every page op -> always readable, never S2MPU. iomem labels its
+     * memblock reservation "reserved"; force-read it so struct-page walks work in the dump. */
+    if (g_pt_ready && tensor_is_backing((uint64_t)page_start))
         return false;
     /* Per-page CMA decision via the allocation bitmap: a cma_alloc'd (device) page is S2MPU-protected
      * -> fill; a free/movable page (where swapped anon/zsmalloc data lives) is CPU-readable -> read. */
