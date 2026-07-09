@@ -9,6 +9,8 @@
 
 /* LEMON's kernel-memory read oracle (defined in mem.c); used to read kimage_voffset's value. */
 extern int read_kernel_memory(const uintptr_t addr, const size_t size, const unsigned char **restrict data);
+/* Physical->kernel-virtual (linear map) translation, defined in mem.c; used to read PT pages by PA. */
+extern uintptr_t phys_to_virt(const struct lemon_ctx *restrict ctx, uintptr_t phy_addr);
 
 /*
  * tensor.c - Google Tensor (Pixel) support for LEMON.
@@ -259,6 +261,111 @@ static void tensor_init_cma(const struct lemon_ctx *restrict ctx) {
 }
 
 /*
+ * Kernel page-table "allow-set" (force-read override).
+ *
+ * Root cause of the recurring over-fill bugs (swapper_pg_dir, init_task, vmemmap PTs): the avoid-list
+ * over-approximates "fatal to read" from DT no-map + /proc/iomem "reserved" + margins, and repeatedly
+ * catches READABLE kernel memory. Kernel page-table pages are the worst victims: the MMU must walk
+ * them, so they are ALWAYS CPU-readable, yet they get pattern-filled when they land in a carveout
+ * margin (e.g. a vmemmap L2 table at an iomem-reserved page). Filling a PT page then breaks address
+ * translation in the dump (vmemmap -> struct page, page-table walks) offline.
+ *
+ * Fix: at init, walk swapper_pg_dir live (via the eBPF read oracle, EL1 - no pKVM/EL2 needed),
+ * collect every intermediate PT page's physical address, and force-read them in tensor_is_protected_page
+ * (like the kimage override). The set is tiny (~379 pages / 1.5 MB on this SoC) and bounded.
+ *
+ * NOTE: this covers KERNEL page tables only (init_mm/swapper). They are stable during a capture and
+ * always live inside a scanned System-RAM range, so the record-PFN + main-loop override is equivalent
+ * to reading them at discovery. Per-process USER page tables (task->mm->pgd), which are volatile, are a
+ * follow-up that needs read-on-discovery (or a frozen target) - not handled here.
+ */
+#define TENSOR_MAX_PT_PAGES 16384
+#define TENSOR_PT_OA_MASK   0x0000FFFFFFFFF000ULL   /* table-descriptor output address bits [47:12] */
+static uint64_t g_pt_pages[TENSOR_MAX_PT_PAGES];    /* page-aligned PAs of kernel PT pages */
+static int g_npt = 0;
+static int g_pt_ready = 0;
+
+static int tensor_pt_cmp(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return (x > y) - (x < y);
+}
+
+/* Linear scan over the (unsorted, growing) set - dedup / cycle guard DURING the walk. n is small. */
+static bool tensor_pt_seen(uint64_t pa) {
+    for (int i = 0; i < g_npt; i++) if (g_pt_pages[i] == pa) return true;
+    return false;
+}
+
+/* Binary search over the sorted set - used per dumped page, so it must be fast. */
+static bool tensor_pt_is_pagetable(uint64_t pa) {
+    if (!g_npt) return false;
+    uint64_t key = pa & ~(uint64_t)(PAGE_SIZE - 1);
+    int lo = 0, hi = g_npt - 1;
+    while (lo <= hi) {
+        int m = (lo + hi) / 2;
+        if      (g_pt_pages[m] == key) return true;
+        else if (g_pt_pages[m] <  key) lo = m + 1;
+        else                           hi = m - 1;
+    }
+    return false;
+}
+
+/*
+ * tensor_pt_walk() - recurse one page-table level, recording each table page.
+ * @pa: physical address of this table page. @level: 0=PGD,1=PMD,2=PTE (VA_BITS=39, 3 levels).
+ * The read oracle returns a shared buffer, so copy the page out before recursing (child reads clobber it).
+ */
+static void tensor_pt_walk(const struct lemon_ctx *restrict ctx, uint64_t pa, int level) {
+    if (level > 2 || g_npt >= TENSOR_MAX_PT_PAGES) return;
+    pa &= ~(uint64_t)(PAGE_SIZE - 1);
+    if (tensor_pt_seen(pa)) return;
+    const unsigned char *d = NULL;
+    if (read_kernel_memory(phys_to_virt(ctx, pa), PAGE_SIZE, &d) < 0 || !d) return;
+    unsigned char page[PAGE_SIZE];
+    memcpy(page, d, PAGE_SIZE);
+    g_pt_pages[g_npt++] = pa;
+    if (level >= 2) return;                    /* PTE table: entries map data pages, not child tables */
+    for (int i = 0; i < (int)(PAGE_SIZE / 8); i++) {
+        uint64_t e;
+        memcpy(&e, page + i * 8, 8);
+        if ((e & 3) == 3)                      /* table descriptor -> next-level table */
+            tensor_pt_walk(ctx, e & TENSOR_PT_OA_MASK, level + 1);
+    }
+}
+
+/*
+ * tensor_init_pt_allowset() - build the kernel page-table allow-set from swapper_pg_dir.
+ * The root PGD is read via its kernel VA (it lives in the kernel image); its child tables are read by PA.
+ */
+static void tensor_init_pt_allowset(const struct lemon_ctx *restrict ctx) {
+    g_pt_ready = 1;
+    uintptr_t swapper = 0;
+    unsigned long addr;
+    char line[512], sym[128];
+    FILE *fp = fopen("/proc/kallsyms", "r");
+    if (!fp) return;
+    while (fgets(line, sizeof(line), fp)) {
+        if (sscanf(line, "%lx %*c %127s", &addr, sym) != 2) continue;
+        if (!strcmp(sym, "swapper_pg_dir")) { swapper = (uintptr_t)addr; break; }
+    }
+    fclose(fp);
+    if (!swapper) { DBG("tensor: swapper_pg_dir not in kallsyms; PT allow-set disabled"); return; }
+
+    const unsigned char *d = NULL;
+    if (read_kernel_memory(swapper, PAGE_SIZE, &d) < 0 || !d) { DBG("tensor: cannot read swapper_pg_dir"); return; }
+    unsigned char root[PAGE_SIZE];
+    memcpy(root, d, PAGE_SIZE);
+    for (int i = 0; i < (int)(PAGE_SIZE / 8); i++) {
+        uint64_t e;
+        memcpy(&e, root + i * 8, 8);
+        if ((e & 3) == 3)                      /* PGD table descriptor -> PMD table */
+            tensor_pt_walk(ctx, e & TENSOR_PT_OA_MASK, 1);
+    }
+    qsort(g_pt_pages, g_npt, sizeof(uint64_t), tensor_pt_cmp);
+    INFO("tensor: kernel page-table allow-set = %d PT pages force-read (unfilled even inside carveouts)", g_npt);
+}
+
+/*
  * parse_node_reg() - read a carveout node's "reg" and add its ranges.
  * @node_dir: absolute path to the reserved-memory child directory.
  *
@@ -393,6 +500,10 @@ int check_init_tensor(struct lemon_ctx *restrict ctx) {
     /* Second source: reserved ranges nested inside System RAM (not in the device tree). */
     add_iomem_reserved(ctx);
 
+    /* Force-read override: kernel page tables are MMU-readable and must never be pattern-filled,
+     * even when they land inside a carveout margin. Built live from swapper_pg_dir (EL1, no EL2). */
+    tensor_init_pt_allowset(ctx);
+
     INFO("tensor: %d no-map carveouts + iomem reserved -> %d avoid-ranges (fw-margin 0x%llx, resv-margin 0x%llx, kimage forced-read)",
          n_nomap, g_nranges, (unsigned long long)TENSOR_FW_MARGIN, (unsigned long long)TENSOR_RESV_MARGIN);
 
@@ -446,6 +557,11 @@ bool tensor_is_protected_page(uintptr_t page_start) {
     if (!g_kimage_ready) tensor_init_kimage();
     /* kimage override: kernel image is CPU-executed, never S2MPU-protected -> always read it. */
     if (g_kimage_lo && (uint64_t)page_start >= g_kimage_lo && (uint64_t)page_start < g_kimage_hi)
+        return false;
+    /* page-table override: kernel PT pages are MMU-walked, so always readable -> force-read even if
+     * they fall inside a carveout margin (fixes vmemmap/swapper over-fill; keeps address translation
+     * intact in the dump). Built in check_init_tensor from swapper_pg_dir. */
+    if (g_pt_ready && tensor_pt_is_pagetable((uint64_t)page_start))
         return false;
     /* Per-page CMA decision via the allocation bitmap: a cma_alloc'd (device) page is S2MPU-protected
      * -> fill; a free/movable page (where swapped anon/zsmalloc data lives) is CPU-readable -> read. */
