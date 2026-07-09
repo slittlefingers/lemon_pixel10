@@ -82,6 +82,27 @@ static bool node_has(const char *node_dir, const char *prop) {
 }
 
 /*
+ * node_disabled() - True if the reserved-memory node's "status" property reads "disabled".
+ *
+ * A device-tree reserved-memory node with status="disabled" is NEVER claimed by the kernel's
+ * reserved-memory framework: it does not appear in reserved_mem[], is not carved out of System RAM,
+ * and is not S2MPU-protected. Its range is ordinary readable RAM (confirmed: s2m@c0000000, a
+ * disabled 74MB "no-map" node, reads fine via a physical -r read and holds live struct dma_buf
+ * metadata). Avoiding it purely because it carries "no-map" pattern-fills readable memory.
+ * A missing status property means the node is enabled by default (return false → keep avoiding).
+ */
+static bool node_disabled(const char *node_dir) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/status", node_dir);
+    FILE *fp = fopen(path, "r");
+    if (!fp) return false;                       /* no status -> enabled by default */
+    char buf[16] = {0};
+    fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    return strncmp(buf, "disabled", 8) == 0;     /* only skip an explicitly disabled node */
+}
+
+/*
  * add_range() - record one [base, base+size) carveout, expanded by the caller's margin.
  * Stored inclusive [start, end]. Margin is clamped at 0 on the low side.
  */
@@ -346,12 +367,20 @@ int check_init_tensor(struct lemon_ctx *restrict ctx) {
         snprintf(node_dir, sizeof(node_dir), "%s/%s", base, de->d_name);
 
         /*
-         * Conservative policy: every no-map carveout is treated as potentially
+         * Conservative policy: every ENABLED no-map carveout is treated as potentially
          * S2MPU-fatal. no-map regions that proved benign (log/ramoops buffers) only
          * cost us a small read margin; the fatal firmware regions are all no-map.
-         * Refine to a firmware-only deny set later if completeness matters.
+         *
+         * BUT a status="disabled" node was never claimed by the kernel (absent from
+         * reserved_mem[]) so its range is ordinary readable RAM, not a carveout. Avoiding it
+         * pattern-fills live data — e.g. s2m@c0000000 (disabled, 74MB) holds the KV dma_buf
+         * descriptors and reads fine. Skip disabled nodes; keep every enabled no-map node.
          */
         if (!node_has(node_dir, "no-map")) continue;
+        if (node_disabled(node_dir)) {
+            DBG("tensor: skip disabled reserved-memory node %s (not carved out, readable RAM)", de->d_name);
+            continue;
+        }
         n_nomap++;
         parse_node_reg(ctx, node_dir, de->d_name);
     }
