@@ -614,6 +614,7 @@ int main(int argc, char **argv) {
      * kimage/PT/vmemmap allow-sets) and exit, without reading or writing any memory. */
     if (ctx.opts.dryrun_map) {
         tensor_dryrun_map(&ctx);
+        ret = EXIT_SUCCESS;          /* clear the '1' left by init_socs_quirks so the report says OK */
         goto cleanup;
     }
 
