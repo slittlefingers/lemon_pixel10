@@ -668,3 +668,99 @@ bool tensor_range_overlaps(uintptr_t start, uintptr_t end) {
             return true;
     return false;
 }
+
+/* ==========================================================================================
+ * Dry-run coverage map (-M). Prints which physical spans LEMON would READ vs pattern-FILL and
+ * WHY, using the exact live state the real dump uses: the avoid-list, the CMA per-page bitmap,
+ * and the kernel-image / page-table / vmemmap-backing force-read allow-sets. Reads NO physical
+ * memory (no S2MPU access) and writes no dump. Categories follow tensor_is_protected_page()'s
+ * decision order, so the map is byte-faithful to what a real capture would fill.
+ * ========================================================================================== */
+enum { TV_RAM, TV_FORCED, TV_CMA_FREE, TV_CMA_DEV, TV_AVOID };
+
+static const char *tensor_page_reason(uint64_t pa, int *cat) {
+    if (!g_kimage_ready) tensor_init_kimage();
+    if (g_kimage_lo && pa >= g_kimage_lo && pa < g_kimage_hi) { *cat = TV_FORCED; return "kernel image"; }
+    if (g_pt_ready && tensor_pt_is_pagetable(pa))             { *cat = TV_FORCED; return "kernel page-table"; }
+    if (g_pt_ready && tensor_is_backing(pa))                  { *cat = TV_FORCED; return "vmemmap backing"; }
+    int cs = cma_status(pa);
+    if (cs == CMA_DEVICE)   { *cat = TV_CMA_DEV;  return "CMA device page"; }
+    if (cs == CMA_READABLE) { *cat = TV_CMA_FREE; return "CMA free/movable"; }
+    for (int i = 0; i < g_nranges; i++)
+        if (pa >= g_ranges[i].start && pa <= g_ranges[i].end) { *cat = TV_AVOID; return g_ranges[i].name; }
+    *cat = TV_RAM; return "readable RAM";
+}
+
+void tensor_dryrun_map(const struct lemon_ctx *restrict ctx) {
+    const double MB = 1024.0 * 1024.0;
+    struct mem_range *range;
+
+    printf("\n== LEMON dump-coverage map (real tensor.c logic; no capture) ==\n");
+
+    if (!ctx->is_tensor) {
+        uint64_t tot = 0;
+        TAILQ_FOREACH(range, &ctx->ram_regions, entries) {
+            printf("  DUMP  0x%llx-0x%llx  %8.1f MB  System RAM (non-Tensor: all readable)\n",
+                   (unsigned long long)range->start, (unsigned long long)(range->end - 1),
+                   (range->end - range->start) / MB);
+            tot += range->end - range->start;
+        }
+        printf("\n  dumpable: %.1f MB (100%%)\n", tot / MB);
+        return;
+    }
+    if (!g_kimage_ready) tensor_init_kimage();
+
+    uint64_t b_read = 0, b_cma_free = 0, b_cma_dev = 0, b_avoid = 0, b_forced = 0;
+
+#define EMIT(A, B, BK, LAB) do {                                                              \
+        uint64_t _sz = (B) - (A) + 1;                                                         \
+        const char *_verb = ((BK) == TV_CMA_DEV || (BK) == TV_AVOID) ? "FILL " : "DUMP ";     \
+        const char *_why;                                                                     \
+        if      ((BK) == TV_AVOID)    { _why = (LAB); b_avoid += _sz; }                        \
+        else if ((BK) == TV_CMA_DEV)  { _why = "CMA device page (cma_alloc'd, excluded)"; b_cma_dev += _sz; }  \
+        else if ((BK) == TV_CMA_FREE) { _why = "CMA free/movable (readable)";             b_cma_free += _sz; } \
+        else                          { _why = "dumpable RAM (readable / force-read)";    b_read += _sz; }     \
+        printf("  %s 0x%llx-0x%llx  %8.1f MB  %s\n", _verb,                                    \
+               (unsigned long long)(A), (unsigned long long)(B), _sz / MB, _why);             \
+    } while (0)
+
+    TAILQ_FOREACH(range, &ctx->ram_regions, entries) {
+        uint64_t rs = range->start, re = range->end - 1;
+        printf("\nSystem RAM 0x%llx-0x%llx  (%.1f MB)\n",
+               (unsigned long long)rs, (unsigned long long)re, (re - rs + 1) / MB);
+
+        uint64_t seg_start = rs;
+        int seg_bucket = -1;
+        char seg_label[64] = "";
+        for (uint64_t pa = rs; pa <= re; pa += PAGE_SIZE) {
+            int cat;
+            const char *reason = tensor_page_reason(pa, &cat);
+            if (cat == TV_FORCED) { b_forced += PAGE_SIZE; cat = TV_RAM; }  /* force-read lumps into readable */
+            if (seg_bucket == -1) {
+                seg_start = pa; seg_bucket = cat;
+                snprintf(seg_label, sizeof(seg_label), "%s", reason);
+            } else if (cat != seg_bucket || (cat == TV_AVOID && strcmp(reason, seg_label) != 0)) {
+                EMIT(seg_start, pa - 1, seg_bucket, seg_label);
+                seg_start = pa; seg_bucket = cat;
+                snprintf(seg_label, sizeof(seg_label), "%s", reason);
+            }
+        }
+        if (seg_bucket != -1) EMIT(seg_start, re, seg_bucket, seg_label);
+    }
+#undef EMIT
+
+    uint64_t dumpable = b_read + b_cma_free;
+    uint64_t excluded = b_avoid + b_cma_dev;
+    uint64_t total = dumpable + excluded;
+    printf("\n-- summary --\n");
+    printf("  dumpable        : %9.1f MB  (readable RAM %.1f + CMA-free %.1f)\n",
+           dumpable / MB, b_read / MB, b_cma_free / MB);
+    printf("  excluded (FILL) : %9.1f MB  (carveouts %.1f + CMA-device %.1f)\n",
+           excluded / MB, b_avoid / MB, b_cma_dev / MB);
+    printf("  total swept     : %9.1f MB   -> %.1f%% dumpable\n",
+           total / MB, total ? 100.0 * dumpable / total : 0.0);
+    printf("  avoid-list      : %d ranges (DT no-map carveouts + /proc/iomem reserved, w/ margins)\n", g_nranges);
+    printf("  force-read      : kimage [0x%llx,0x%llx) + %d PT pages + %d vmemmap ranges  (%.1f MB rescued)\n",
+           (unsigned long long)g_kimage_lo, (unsigned long long)g_kimage_hi, g_npt, g_nvmbk, b_forced / MB);
+    printf("  CMA areas       : %d  (per-page: device excluded, free/movable read)\n", g_ncma);
+}

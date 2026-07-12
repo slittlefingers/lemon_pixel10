@@ -148,6 +148,7 @@ struct options {
         unsigned int force_qualcomm: 1; /* -q: force Qualcomm secure-page detection. */
         unsigned int force_dump_range: 1; /* -r/-v: dump a single physical/virtual range. */
         unsigned int force_test_run: 1; /* -t: force BPF_PROG_TEST_RUN trigger. */
+        unsigned int dryrun_map: 1;     /* -M: print dumpable/excluded map + reasons, no dump. */
     };
 
     struct mem_range forced_range;  /* Address and size from -r/-v; only valid when force_dump_range. */

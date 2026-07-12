@@ -28,6 +28,7 @@ extern void cleanup_mem_ebpf(void);
 extern void range_list_free(struct ram_regions *list);
 extern int check_init_qualcomm(struct lemon_ctx *restrict ctx);
 extern int check_init_tensor(struct lemon_ctx *restrict ctx);
+extern void tensor_dryrun_map(const struct lemon_ctx *restrict ctx);
 extern int run_sgtable(struct lemon_ctx *restrict ctx, pid_t target);
 
 #define LEMON_VERSION  "lemon-" BRANCH "-" VERSION
@@ -75,6 +76,7 @@ static const struct argp_option options[] = {
     {"huge",      'H', 0,               0, "Use huge pages (2MB) instead of 4KB", 3},
     {"qcom",      'q', 0,               0, "Force the use of Qualcomm quirks", 3},
     {"sgtable",   'S', "PID",           0, "Emit the PID's dma-buf sg_table page lists (CSV, no dump)", 3},
+    {"map",       'M', 0,               0, "Print the dumpable/excluded physical map + reasons (no dump; Tensor)", 3},
     {"rphy",     'r', "ADDRESS:SIZE",  0, "Dump physical pages range", 3},
     {"rvirt",    'v', "ADDRESS:SIZE",  0, "Dump virtual pages range", 3},
     {"testrun",  't', 0,               0, "Force the use of BPF_PROG_TEST_RUN as eBPF trigger", 3},
@@ -191,7 +193,11 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
         case 'u':
             opts->force_iomem_user = true;
             break;
-        
+
+        case 'M':
+            opts->dryrun_map = true;
+            break;
+
         /* --- Advanced / hardware --- */
         case 'g':
             opts->debug = true;
@@ -229,8 +235,8 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             /* Port option is only valid in network dump mode */
             if(opts->dump_mode != MODE_NETWORK && opts->port != DEFAULT_PORT) argp_error(state, "-p can be used only in network dump mode");
 
-            /* Ensure at least one mode is specified (sgtable mode needs no dump destination). */
-            if (opts->dump_mode == MODE_UNDEFINED && !opts->sgtable_pid) {
+            /* Ensure at least one mode is specified (sgtable / -M map modes need no destination). */
+            if (opts->dump_mode == MODE_UNDEFINED && !opts->sgtable_pid && !opts->dryrun_map) {
                 argp_error(state, "Either disk mode or network mode must be specified");
             }
 
@@ -603,6 +609,13 @@ int main(int argc, char **argv) {
 
     /* Qualcomm init returns 0 (skip), 1 (ok), or errno (>1) on hard failure. */
     if((ret = init_socs_quirks(&ctx)) > 1) goto cleanup;
+
+    /* -M: print the dumpable/excluded physical map + reasons (real avoid-list + CMA bitmap +
+     * kimage/PT/vmemmap allow-sets) and exit, without reading or writing any memory. */
+    if (ctx.opts.dryrun_map) {
+        tensor_dryrun_map(&ctx);
+        goto cleanup;
+    }
 
     /* Dump on a file */
     if(ctx.opts.dump_mode == MODE_DISK) {
