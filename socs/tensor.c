@@ -40,19 +40,53 @@ extern uintptr_t phys_to_virt(const struct lemon_ctx *restrict ctx, uintptr_t ph
  * Safety margins applied on both sides of a carveout to cover S2MPU spilling slightly past the
  * device-tree boundary (or a CPU prefetch crossing into the carveout).
  *
- * We now use TWO margins instead of one blanket 2 MB:
- *   - FW_MARGIN (firmware no-map carveouts): stay generous. Firmware carveouts have NO kernel data
- *     adjacent, so a wide margin costs nothing and keeps us safe near the real S2MPU regions.
+ * We now use THREE margins instead of one blanket 2 MB:
+ *   - FW_MARGIN (firmware/hypervisor no-map carveouts): stay generous. Real S2MPU regions sit
+ *     here, so a wide margin is cheap insurance.
+ *   - FW_MARGIN_LOW (low-zone no-map carveouts): small. See the evidence note below.
  *   - RESV_MARGIN (/proc/iomem "reserved"): tiny. These reserved ranges sit next to live kernel
  *     slab / kernel-image memory (init_task, swapper_pg_dir, sg_tables, dma_buf structs, name
  *     strings). A 2 MB margin here was pure collateral — it pattern-filled readable metadata. A
  *     small margin still covers prefetch/S2MPU-spill while returning that metadata to the dump.
+ *
+ * WHY THE LOW ZONE GETS A SMALL MARGIN (measured on mem_16.lime, kernel 6.6.102-android15-8):
+ *   The blanket 2 MB FW margin pattern-filled 23.7 MB of memory the kernel itself publishes as
+ *   "System RAM" in /proc/iomem. It is not S2MPU-protected: the real no-map carveouts are already
+ *   subtracted from the System RAM list (e.g. xhci_dma_dram@97000000 shows up as an exact 4 MB
+ *   gap between the 0x95700000-0x96ffffff and 0x97400000-0x9fbfffff ranges), so the margin can
+ *   only ever eat ordinary RAM. Proof it is live kernel memory: a task_struct sits at 0x96e6ddc0,
+ *   1.57 MB below that carveout, inside the filled band. The kernel dereferences it at EL1 on
+ *   every context switch, so that address cannot be Stage-2 protected. Filling it truncated
+ *   Volatility3's task-list walk after 287 processes (the walk read "TENSOR PROTECTED" as a
+ *   list pointer, i.e. VA 0x5020524f534e4554).
+ *
+ *   The low-zone no-map nodes are log/trace/debug and DMA-buffer carveouts (cdd*, *_tracepoint_*,
+ *   debug_kinfo_reserved, log_kevents, xhci_dma_dram, ...). The genuine firmware and secure
+ *   regions (gpu_fw, tpu_fw, gxp_*, gsa*, sec_dram, abl, bl31_dram, s2m, gc_rmem) are all based
+ *   at or above TENSOR_FW_LOWZONE_END and keep the full margin. Two low-zone nodes are firmware
+ *   despite their low base and are listed in TENSOR_FW_STRICT_NODES.
+ *
+ *   The residual risk the small margin still covers is a CPU prefetch crossing the boundary while
+ *   reading the last System-RAM page before a carveout; 64 KB is 16 pages of slack, far beyond any
+ *   prefetcher's lookahead. Set TENSOR_FW_MARGIN_LOW to 0 only after a -M dry run plus a real
+ *   capture confirms no boundary page faults.
+ *
  * The kernel-image override in tensor_is_protected_page() additionally forces the kernel image to
  * be read even if it lands inside a margin (the CPU executes from it, so it is never protected).
  * TUNE via docs/test-runbook.md if a boundary page ever faults.
  */
-#define TENSOR_FW_MARGIN   0x200000ULL   /* 2 MB around firmware no-map carveouts */
-#define TENSOR_RESV_MARGIN 0x10000ULL    /* 64 KB around /proc/iomem reserved ranges */
+#define TENSOR_FW_MARGIN      0x200000ULL   /* 2 MB  around firmware/hypervisor no-map carveouts */
+#define TENSOR_FW_MARGIN_LOW  0x10000ULL    /* 64 KB around low-zone (log/trace/DMA) carveouts */
+#define TENSOR_FW_LOWZONE_END 0x98000000ULL /* no-map nodes based below this use the small margin */
+#define TENSOR_RESV_MARGIN    0x10000ULL    /* 64 KB around /proc/iomem reserved ranges */
+
+/*
+ * Nodes that keep the full FW margin even though they are based inside the low zone. Matched
+ * case-insensitively as substrings of the device-tree node name.
+ *   pkvm_guest_firmware@8af00000 - EL2 / pKVM firmware; a CPU read there is fatal.
+ *   aoc@8d200000                 - always-on coprocessor firmware, S2MPU status not established.
+ */
+static const char *const TENSOR_FW_STRICT_NODES[] = { "pkvm", "aoc" };
 
 struct tensor_range {
     uint64_t start;    /* inclusive */
@@ -122,6 +156,24 @@ static void add_range(const struct lemon_ctx *restrict ctx, const char *name, ui
     DBG("tensor: avoid %-28s phys 0x%llx-0x%llx (carveout 0x%llx+0x%llx +/-margin)",
         name, (unsigned long long)lo, (unsigned long long)hi,
         (unsigned long long)base, (unsigned long long)size);
+}
+
+/*
+ * tensor_fw_margin_for() - pick the no-map carveout margin for one node.
+ * @name: device-tree node name (e.g. "xhci_dma_dram@97000000").
+ * @base: carveout physical base from its "reg".
+ *
+ * Full TENSOR_FW_MARGIN for anything at or above TENSOR_FW_LOWZONE_END, and for the low-zone
+ * nodes named in TENSOR_FW_STRICT_NODES. Everything else (log/trace/debug and DMA-buffer
+ * carveouts) gets TENSOR_FW_MARGIN_LOW. Rationale and measurements: see the margin comment above.
+ */
+static uint64_t tensor_fw_margin_for(const char *name, uint64_t base) {
+    if (base >= TENSOR_FW_LOWZONE_END) return TENSOR_FW_MARGIN;
+
+    for (size_t i = 0; i < sizeof(TENSOR_FW_STRICT_NODES) / sizeof(TENSOR_FW_STRICT_NODES[0]); i++)
+        if (strcasestr(name, TENSOR_FW_STRICT_NODES[i])) return TENSOR_FW_MARGIN;
+
+    return TENSOR_FW_MARGIN_LOW;
 }
 
 /*
@@ -459,8 +511,10 @@ static void parse_node_reg(const struct lemon_ctx *restrict ctx, const char *nod
         DBG("tensor: %s has reg of %zu bytes (not 16-aligned), skipping", name, n);
         return;
     }
-    for (size_t off = 0; off + 16 <= n; off += 16)
-        add_range(ctx, name, be64(buf + off), be64(buf + off + 8), TENSOR_FW_MARGIN);
+    for (size_t off = 0; off + 16 <= n; off += 16) {
+        const uint64_t cbase = be64(buf + off);
+        add_range(ctx, name, cbase, be64(buf + off + 8), tensor_fw_margin_for(name, cbase));
+    }
 }
 
 /*
@@ -574,8 +628,11 @@ int check_init_tensor(struct lemon_ctx *restrict ctx) {
      * even when they land inside a carveout margin. Built live from swapper_pg_dir (EL1, no EL2). */
     tensor_init_pt_allowset(ctx);
 
-    INFO("tensor: %d no-map carveouts + iomem reserved -> %d avoid-ranges (fw-margin 0x%llx, resv-margin 0x%llx, kimage forced-read)",
-         n_nomap, g_nranges, (unsigned long long)TENSOR_FW_MARGIN, (unsigned long long)TENSOR_RESV_MARGIN);
+    INFO("tensor: %d no-map carveouts + iomem reserved -> %d avoid-ranges "
+         "(fw-margin 0x%llx, fw-margin-low 0x%llx below 0x%llx, resv-margin 0x%llx, kimage forced-read)",
+         n_nomap, g_nranges, (unsigned long long)TENSOR_FW_MARGIN,
+         (unsigned long long)TENSOR_FW_MARGIN_LOW, (unsigned long long)TENSOR_FW_LOWZONE_END,
+         (unsigned long long)TENSOR_RESV_MARGIN);
 
     if (g_nranges == 0)
         WARN("tensor: no carveout ranges parsed; dump may hit S2MPU and reboot");
