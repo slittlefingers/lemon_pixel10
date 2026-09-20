@@ -401,6 +401,96 @@ static bool tensor_is_backing(uint64_t pa) {
     return false;
 }
 
+/*
+ * Linear-map (direct-map) coverage allow-set.
+ *
+ * A physical page the kernel identity/direct-maps in swapper_pg_dir (leaf VA == phys_to_virt(pa))
+ * is ordinary kernel-owned DRAM: the CPU reads it at EL1, so it can never be S2MPU-protected. The
+ * nested "reserved" children of System RAM in /proc/iomem are memblock reservations of exactly this
+ * kind (per-cpu, crashkernel, kernel bss/init reserves, the struct-page array), and they hold live
+ * kernel objects - e.g. a task_struct at 0x86cfb840 whose fill truncated Volatility3's task walk.
+ * add_iomem_reserved() would pattern-fill them wholesale. We collect the real direct-map coverage
+ * live from the (force-read) kernel page tables and use it as a per-page force-read override.
+ *
+ * DEVICE-POOL EXCLUSION: some reserved regions are direct-mapped yet still handed to a device/EL2
+ * at runtime via pKVM WITHOUT tearing down the CPU linear map (the modem cp_rmem pools, dma_region
+ * carveouts). Those are declared as device-tree reserved-memory nodes, so g_dtresv records every DT
+ * reserved-memory reg range and the override refuses to release any page a DT node claims. CMA is a
+ * separate dynamic case handled earlier by the per-page bitmap (cma_status), which keeps priority.
+ */
+#define TENSOR_MAX_LIN  8192
+static struct tensor_range2 g_lin[TENSOR_MAX_LIN];
+static int g_nlin = 0;
+static int g_lin_ready = 0;
+
+static void tensor_add_lin(uint64_t base, uint64_t size) {
+    if (g_nlin >= TENSOR_MAX_LIN || !size) return;
+    g_lin[g_nlin].base = base;
+    g_lin[g_nlin].end  = base + size - 1;
+    g_nlin++;
+}
+
+static void tensor_merge_lin(void) {
+    if (g_nlin < 2) return;
+    qsort(g_lin, g_nlin, sizeof(g_lin[0]), tensor_vmbk_cmp);
+    int w = 0;
+    for (int r = 1; r < g_nlin; r++) {
+        if (g_lin[r].base <= g_lin[w].end + 1) {
+            if (g_lin[r].end > g_lin[w].end) g_lin[w].end = g_lin[r].end;
+        } else {
+            g_lin[++w] = g_lin[r];
+        }
+    }
+    g_nlin = w + 1;
+}
+
+static bool tensor_linear_mapped(uint64_t pa) {
+    int lo = 0, hi = g_nlin - 1;
+    while (lo <= hi) {
+        int m = (lo + hi) / 2;
+        if      (pa < g_lin[m].base) hi = m - 1;
+        else if (pa > g_lin[m].end)  lo = m + 1;
+        else return true;
+    }
+    return false;
+}
+
+/*
+ * Device-tree reserved-memory claim set: the reg ranges of EVERY reserved-memory node (no-map or
+ * not). Used only to veto the linear-map override for device/EL2 pools that stay direct-mapped.
+ * Small list, linear scan.
+ */
+#define TENSOR_MAX_DTRESV 256
+static struct tensor_range2 g_dtresv[TENSOR_MAX_DTRESV];
+static int g_ndtresv = 0;
+
+static void tensor_add_dtresv(uint64_t base, uint64_t size) {
+    if (g_ndtresv >= TENSOR_MAX_DTRESV || !size) return;
+    g_dtresv[g_ndtresv].base = base;
+    g_dtresv[g_ndtresv].end  = base + size - 1;
+    g_ndtresv++;
+}
+
+static bool tensor_dt_reserved(uint64_t pa) {
+    for (int i = 0; i < g_ndtresv; i++)
+        if (pa >= g_dtresv[i].base && pa <= g_dtresv[i].end) return true;
+    return false;
+}
+
+/* Record every reg range of a reserved-memory node (called for ALL nodes, before the no-map filter). */
+static void collect_dtresv_reg(const char *node_dir) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/reg", node_dir);
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return;
+    uint8_t buf[16 * 16];
+    size_t n = fread(buf, 1, sizeof(buf), fp);
+    fclose(fp);
+    if (n == 0 || n % 16 != 0) return;
+    for (size_t off = 0; off + 16 <= n; off += 16)
+        tensor_add_dtresv(be64(buf + off), be64(buf + off + 8));
+}
+
 /* Linear scan over the (unsorted, growing) set - dedup / cycle guard DURING the walk. n is small. */
 static bool tensor_pt_seen(uint64_t pa) {
     for (int i = 0; i < g_npt; i++) if (g_pt_pages[i] == pa) return true;
@@ -442,12 +532,21 @@ static void tensor_pt_walk(const struct lemon_ctx *restrict ctx, uint64_t pa, in
         memcpy(&e, page + i * 8, 8);
         int t = e & 3;
         uint64_t va = va_base | ((uint64_t)i << sh);
-        if (level < 2 && t == 3)                              /* table descriptor -> next-level table */
+        if (level < 2 && t == 3) {                            /* table descriptor -> next-level table */
             tensor_pt_walk(ctx, e & TENSOR_PT_OA_MASK, level + 1, va);
-        else if (level == 1 && t == 1 && TENSOR_IS_VMEMMAP(va))  /* 2MB block: struct-page backing */
-            tensor_add_backing(e & TENSOR_PMD_BLK_MASK, 0x200000ULL);
-        else if (level == 2 && t == 3 && TENSOR_IS_VMEMMAP(va))  /* 4KB page: struct-page backing */
-            tensor_add_backing(e & TENSOR_PT_OA_MASK, PAGE_SIZE);
+        } else if (level == 1 && t == 1) {                    /* 2MB block leaf */
+            uint64_t oa = e & TENSOR_PMD_BLK_MASK;
+            if (TENSOR_IS_VMEMMAP(va))                        /* struct-page backing */
+                tensor_add_backing(oa, 0x200000ULL);
+            else if ((uint64_t)phys_to_virt(ctx, oa) == va)   /* direct/linear map -> ordinary RAM */
+                tensor_add_lin(oa, 0x200000ULL);
+        } else if (level == 2 && t == 3) {                    /* 4KB page leaf */
+            uint64_t oa = e & TENSOR_PT_OA_MASK;
+            if (TENSOR_IS_VMEMMAP(va))                        /* struct-page backing */
+                tensor_add_backing(oa, PAGE_SIZE);
+            else if ((uint64_t)phys_to_virt(ctx, oa) == va)   /* direct/linear map -> ordinary RAM */
+                tensor_add_lin(oa, PAGE_SIZE);
+        }
     }
 }
 
@@ -476,15 +575,27 @@ static void tensor_init_pt_allowset(const struct lemon_ctx *restrict ctx) {
     for (int i = 0; i < (int)(PAGE_SIZE / 8); i++) {
         uint64_t e;
         memcpy(&e, root + i * 8, 8);
-        if ((e & 3) == 3)                      /* PGD table descriptor -> PMD table */
-            tensor_pt_walk(ctx, e & TENSOR_PT_OA_MASK, 1, TENSOR_KVA_BASE | ((uint64_t)i << 30));
+        uint64_t va = TENSOR_KVA_BASE | ((uint64_t)i << 30);
+        if ((e & 3) == 3) {                    /* PGD table descriptor -> PMD table */
+            tensor_pt_walk(ctx, e & TENSOR_PT_OA_MASK, 1, va);
+        } else if ((e & 3) == 1) {             /* 1GB block leaf at PGD level (large linear-map span) */
+            uint64_t oa = e & 0x0000FFFFC0000000ULL;   /* [47:30] output address */
+            if ((uint64_t)phys_to_virt(ctx, oa) == va) /* direct/linear map -> ordinary RAM */
+                tensor_add_lin(oa, 0x40000000ULL);
+        }
     }
     qsort(g_pt_pages, g_npt, sizeof(uint64_t), tensor_pt_cmp);
     tensor_merge_backing();
+    tensor_merge_lin();
+    g_lin_ready = 1;
     uint64_t bk_mb = 0;
     for (int i = 0; i < g_nvmbk; i++) bk_mb += (g_vmbk[i].end - g_vmbk[i].base + 1);
-    INFO("tensor: kernel page-table allow-set = %d PT pages; vmemmap struct-page backing = %d range(s), %llu MB (both force-read)",
-         g_npt, g_nvmbk, (unsigned long long)(bk_mb >> 20));
+    uint64_t lin_mb = 0;
+    for (int i = 0; i < g_nlin; i++) lin_mb += (g_lin[i].end - g_lin[i].base + 1);
+    INFO("tensor: kernel page-table allow-set = %d PT pages; vmemmap struct-page backing = %d range(s), %llu MB; "
+         "linear-map coverage = %d range(s), %llu MB (all force-read; DT-reserved pools excluded)",
+         g_npt, g_nvmbk, (unsigned long long)(bk_mb >> 20),
+         g_nlin, (unsigned long long)(lin_mb >> 20));
 }
 
 /*
@@ -607,6 +718,10 @@ int check_init_tensor(struct lemon_ctx *restrict ctx) {
          * pattern-fills live data — e.g. s2m@c0000000 (disabled, 74MB) holds the KV dma_buf
          * descriptors and reads fine. Skip disabled nodes; keep every enabled no-map node.
          */
+        /* Record this node's reg for the device-pool veto of the linear-map override, regardless of
+         * no-map: modem cp_rmem / dma_region pools are direct-mapped but runtime-protected. */
+        collect_dtresv_reg(node_dir);
+
         if (!node_has(node_dir, "no-map")) continue;
         if (node_disabled(node_dir)) {
             DBG("tensor: skip disabled reserved-memory node %s (not carved out, readable RAM)", de->d_name);
@@ -696,10 +811,19 @@ bool tensor_is_protected_page(uintptr_t page_start) {
     if (g_pt_ready && tensor_is_backing((uint64_t)page_start))
         return false;
     /* Per-page CMA decision via the allocation bitmap: a cma_alloc'd (device) page is S2MPU-protected
-     * -> fill; a free/movable page (where swapped anon/zsmalloc data lives) is CPU-readable -> read. */
+     * -> fill; a free/movable page (where swapped anon/zsmalloc data lives) is CPU-readable -> read.
+     * This is the DYNAMIC-protection check and MUST stay above the linear-map override below: a page
+     * that is direct-mapped yet currently cma_alloc'd to a device is caught here and filled. */
     int cs = cma_status((uint64_t)page_start);
     if (cs == CMA_DEVICE)   return true;
     if (cs == CMA_READABLE) return false;
+    /* linear-map override: a page the kernel direct-maps (leaf VA == phys_to_virt) that no device-tree
+     * reserved-memory node claims is ordinary kernel-owned RAM (memblock reserve: slab, task_struct,
+     * per-cpu). The CPU reads it at EL1, so it is never S2MPU-protected -> force-read it even though
+     * add_iomem_reserved() put its /proc/iomem "reserved" range on the avoid-list. DT-claimed pools
+     * (cp_rmem, dma_region) are excluded and fall through to the avoid-list below. */
+    if (g_lin_ready && tensor_linear_mapped((uint64_t)page_start) && !tensor_dt_reserved((uint64_t)page_start))
+        return false;
     for (int i = 0; i < g_nranges; i++)
         if ((uint64_t)page_start >= g_ranges[i].start &&
             (uint64_t)page_start <= g_ranges[i].end)
@@ -743,6 +867,7 @@ static const char *tensor_page_reason(uint64_t pa, int *cat) {
     int cs = cma_status(pa);
     if (cs == CMA_DEVICE)   { *cat = TV_CMA_DEV;  return "CMA device page"; }
     if (cs == CMA_READABLE) { *cat = TV_CMA_FREE; return "CMA free/movable"; }
+    if (g_lin_ready && tensor_linear_mapped(pa) && !tensor_dt_reserved(pa)) { *cat = TV_FORCED; return "linear-map (kernel RAM)"; }
     for (int i = 0; i < g_nranges; i++)
         if (pa >= g_ranges[i].start && pa <= g_ranges[i].end) { *cat = TV_AVOID; return g_ranges[i].name; }
     *cat = TV_RAM; return "readable RAM";
