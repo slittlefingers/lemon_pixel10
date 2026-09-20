@@ -423,6 +423,23 @@ static struct tensor_range2 g_lin[TENSOR_MAX_LIN];
 static int g_nlin = 0;
 static int g_lin_ready = 0;
 
+/*
+ * The linear-map override applies to the LOW DRAM bank only (< TENSOR_LINMAP_HI).
+ *
+ * "Direct-mapped => CPU-readable" holds for the low bank's static memblock reserves (per-cpu,
+ * crashkernel, kernel bss/init, the regions that hold task_struct slab), but NOT for the high bank.
+ * A real capture (kernel 6.6.102-android15-8) rebooted (S2MPU async SError) ~80-90% through the high
+ * bank 0x880000000-0xaffffffff: its bare "reserved" children (e.g. 0xac7a00000, 0xaf8500000) are
+ * dynamically handed to a device / EL2 via pKVM yet KEEP their CPU linear mapping and carry no
+ * device-tree reserved-memory node, so neither the DT-reserved veto nor the CMA bitmap catches them.
+ * A direct-map present bit is therefore NOT sufficient proof of readability there. The low bank
+ * dumped cleanly in the same capture. The high bank keeps the original conservative fill; its
+ * genuinely-needed data is still force-read by the independent vmemmap-backing override (mem_map)
+ * and the CMA per-page bitmap. Physical layout: low bank ends < 0x100000000, high bank starts at
+ * 0x880000000, so any threshold between them is equivalent; 4 GB is the clean cut.
+ */
+#define TENSOR_LINMAP_HI  0x100000000ULL
+
 static void tensor_add_lin(uint64_t base, uint64_t size) {
     if (g_nlin >= TENSOR_MAX_LIN || !size) return;
     g_lin[g_nlin].base = base;
@@ -590,12 +607,20 @@ static void tensor_init_pt_allowset(const struct lemon_ctx *restrict ctx) {
     g_lin_ready = 1;
     uint64_t bk_mb = 0;
     for (int i = 0; i < g_nvmbk; i++) bk_mb += (g_vmbk[i].end - g_vmbk[i].base + 1);
-    uint64_t lin_mb = 0;
-    for (int i = 0; i < g_nlin; i++) lin_mb += (g_lin[i].end - g_lin[i].base + 1);
+    uint64_t lin_mb = 0, lin_lo_mb = 0;
+    for (int i = 0; i < g_nlin; i++) {
+        lin_mb += (g_lin[i].end - g_lin[i].base + 1);
+        if (g_lin[i].base < TENSOR_LINMAP_HI) {
+            uint64_t cap = (g_lin[i].end < TENSOR_LINMAP_HI - 1) ? g_lin[i].end : TENSOR_LINMAP_HI - 1;
+            lin_lo_mb += (cap - g_lin[i].base + 1);
+        }
+    }
     INFO("tensor: kernel page-table allow-set = %d PT pages; vmemmap struct-page backing = %d range(s), %llu MB; "
-         "linear-map coverage = %d range(s), %llu MB (all force-read; DT-reserved pools excluded)",
+         "linear-map coverage = %d range(s), %llu MB total, %llu MB force-read below 0x%llx "
+         "(low-bank only; high bank kept conservative; DT-reserved pools excluded)",
          g_npt, g_nvmbk, (unsigned long long)(bk_mb >> 20),
-         g_nlin, (unsigned long long)(lin_mb >> 20));
+         g_nlin, (unsigned long long)(lin_mb >> 20), (unsigned long long)(lin_lo_mb >> 20),
+         (unsigned long long)TENSOR_LINMAP_HI);
 }
 
 /*
@@ -822,7 +847,8 @@ bool tensor_is_protected_page(uintptr_t page_start) {
      * per-cpu). The CPU reads it at EL1, so it is never S2MPU-protected -> force-read it even though
      * add_iomem_reserved() put its /proc/iomem "reserved" range on the avoid-list. DT-claimed pools
      * (cp_rmem, dma_region) are excluded and fall through to the avoid-list below. */
-    if (g_lin_ready && tensor_linear_mapped((uint64_t)page_start) && !tensor_dt_reserved((uint64_t)page_start))
+    if (g_lin_ready && (uint64_t)page_start < TENSOR_LINMAP_HI &&
+        tensor_linear_mapped((uint64_t)page_start) && !tensor_dt_reserved((uint64_t)page_start))
         return false;
     for (int i = 0; i < g_nranges; i++)
         if ((uint64_t)page_start >= g_ranges[i].start &&
@@ -867,7 +893,7 @@ static const char *tensor_page_reason(uint64_t pa, int *cat) {
     int cs = cma_status(pa);
     if (cs == CMA_DEVICE)   { *cat = TV_CMA_DEV;  return "CMA device page"; }
     if (cs == CMA_READABLE) { *cat = TV_CMA_FREE; return "CMA free/movable"; }
-    if (g_lin_ready && tensor_linear_mapped(pa) && !tensor_dt_reserved(pa)) { *cat = TV_FORCED; return "linear-map (kernel RAM)"; }
+    if (g_lin_ready && pa < TENSOR_LINMAP_HI && tensor_linear_mapped(pa) && !tensor_dt_reserved(pa)) { *cat = TV_FORCED; return "linear-map (kernel RAM)"; }
     for (int i = 0; i < g_nranges; i++)
         if (pa >= g_ranges[i].start && pa <= g_ranges[i].end) { *cat = TV_AVOID; return g_ranges[i].name; }
     *cat = TV_RAM; return "readable RAM";
