@@ -496,6 +496,7 @@ int fill_mem_result_buf(const char* pattern, size_t pattern_size, size_t chunk_s
         memcpy(read_mem_result->buf + i, pattern, size);
     }
 
+    *data = read_mem_result->buf;
     return 0;
 }
 /*
